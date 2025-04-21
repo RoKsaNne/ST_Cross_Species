@@ -29,15 +29,10 @@ class cross_GAE(nn.Module):
         self.GAT_head = GAT_head
         self.num_classes = num_classes
 
-        
         #print(shared_x_dim, ref_x_dim, target_x_dim, latent_dim, shared_hidden_dims) 2000 2000 2000 128 [128, 128]
 
-        # if hidden_dims is None:
-        #     hidden_dims = [128, 128]
-    
         ### Encoders
         # Shared Encoder
-
         modules_encoder_shared = []
         shared_dim = self.shared_x_dim
         for h_dim in shared_hidden_dims:
@@ -205,21 +200,110 @@ class cross_GAE(nn.Module):
 
         return ref_homo, ref_nonhomo, target_homo, target_nonhomo
 
-    def forward(self, ref_data, target_data):
-        ref_homo, ref_nonhomo, ref_edge = ref_data.homo_x, ref_data.nonhomo_x, ref_data.edge_index
-        target_homo, target_nonhomo, target_edge = target_data.homo_x, target_data.nonhomo_x, target_data.edge_index
+    # def forward(self, ref_data, target_data):
+    #     ref_homo, ref_nonhomo, ref_edge = ref_data.homo_x, ref_data.nonhomo_x, ref_data.edge_index
+    #     target_homo, target_nonhomo, target_edge = target_data.homo_x, target_data.nonhomo_x, target_data.edge_index
 
-        latent_embed_mmd, ref_latent, target_latent = self.encode(ref_homo, target_homo, ref_nonhomo, target_nonhomo, ref_edge, target_edge)
-        recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo = self.decode_recons(ref_latent, target_latent, ref_edge, target_edge)
-        ref_logits = self.classifier(ref_latent)
-        target_logits = self.classifier(target_latent)
+    #     latent_embed_mmd, ref_latent, target_latent = self.encode(ref_homo, target_homo, ref_nonhomo, target_nonhomo, ref_edge, target_edge)
+    #     recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo = self.decode_recons(ref_latent, target_latent, ref_edge, target_edge)
+    #     ref_logits = self.classifier(ref_latent)
+    #     target_logits = self.classifier(target_latent)
 
-        # not needed for now, but maybe later
-        recons_ref = torch.cat([recons_ref_homo, recons_ref_nonhomo], dim=1)
-        recons_target = torch.cat([recons_target_homo, recons_target_nonhomo], dim=1)
+    #     # not needed for now, but maybe later
+    #     recons_ref = torch.cat([recons_ref_homo, recons_ref_nonhomo], dim=1)
+    #     recons_target = torch.cat([recons_target_homo, recons_target_nonhomo], dim=1)
         
-        return  [latent_embed_mmd, ref_latent, target_latent, recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo, ref_logits, target_logits]
-    
+    #     return  [latent_embed_mmd, ref_latent, target_latent, recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo, ref_logits, target_logits]
+    def forward(self, ref_data=None, target_data=None):
+        latent_embed_mmd = {}
+        ref_latent = target_latent = None
+        recons_ref_homo = recons_ref_nonhomo = None
+        recons_target_homo = recons_target_nonhomo = None
+        ref_logits = target_logits = None
+
+        if ref_data is not None:
+            ref_latent, (ref_homo_latent, ref_nonhomo_latent) = self._encode_side(
+                ref_data.homo_x, ref_data.nonhomo_x, ref_data.edge_index,
+                self.encoder_shared, self.linear_shared,
+                self.encoder_ref, self.linear_ref
+            )
+            latent_embed_mmd['ref_homo'] = ref_homo_latent
+            latent_embed_mmd['ref_nonhomo'] = ref_nonhomo_latent
+
+            recons_ref_homo, recons_ref_nonhomo = self._decode_side(
+                ref_latent, ref_data.edge_index,
+                self.decoder_shared, self.final_layer_shared,
+                self.decoder_ref, self.final_layer_ref
+            )
+
+            ref_logits = self._classify_side(ref_latent)
+
+        if target_data is not None:
+            target_latent, (target_homo_latent, target_nonhomo_latent) = self._encode_side(
+                target_data.homo_x, target_data.nonhomo_x, target_data.edge_index,
+                self.encoder_shared, self.linear_shared,
+                self.encoder_target, self.linear_target
+            )
+            latent_embed_mmd['target_homo'] = target_homo_latent
+            latent_embed_mmd['target_nonhomo'] = target_nonhomo_latent
+
+            recons_target_homo, recons_target_nonhomo = self._decode_side(
+                target_latent, target_data.edge_index,
+                self.decoder_shared, self.final_layer_shared,
+                self.decoder_target, self.final_layer_target
+            )
+
+            target_logits = self._classify_side(target_latent)
+
+        return [
+            latent_embed_mmd,
+            ref_latent,
+            target_latent,
+            recons_ref_homo,
+            recons_ref_nonhomo,
+            recons_target_homo,
+            recons_target_nonhomo,
+            ref_logits,
+            target_logits
+        ]
+        
+    def _encode_side(self, homo_x, nonhomo_x, edge_index, shared_encoder, shared_linear, nonhomo_encoder, nonhomo_linear):
+        # Encode shared part
+        shared = homo_x
+        for layer in shared_encoder:
+            shared = layer(shared, edge_index)
+        shared_latent = shared_linear(shared)
+
+        # Encode non-homogeneous part
+        nonhomo = nonhomo_x
+        for layer in nonhomo_encoder:
+            nonhomo = layer(nonhomo, edge_index)
+        nonhomo_latent = nonhomo_linear(nonhomo)
+
+        # Concat and FC
+        concat_latent = torch.cat([shared_latent, nonhomo_latent], dim=1)
+        final_latent = self.decoder_linear_ref(concat_latent)
+
+        return final_latent, (shared_latent, nonhomo_latent)
+
+    def _decode_side(self, latent, edge_index, shared_decoder, shared_final, nonhomo_decoder, nonhomo_final):
+        # Shared decode
+        shared = latent
+        for layer in shared_decoder:
+            shared = layer(shared, edge_index)
+        shared_out = shared_final(shared)
+
+        # Non-homogeneous decode
+        nonhomo = latent
+        for layer in nonhomo_decoder:
+            nonhomo = layer(nonhomo, edge_index)
+        nonhomo_out = nonhomo_final(nonhomo)
+
+        return shared_out, nonhomo_out
+
+    def _classify_side(self, latent):
+        return self.classifier(latent)
+
     def loss_function(self,
                       *args,
                       ) -> dict:

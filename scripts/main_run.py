@@ -95,8 +95,28 @@ def main():
     else: 
         dataset = GraphDataset.from_saved(f'{args.savedir}/ref_data.pt', f'{args.savedir}/target_data.pt')
     cross_gae = cross_GAE(args, dataset)
-    cross_gae.train()
-    pred_labels_ref, gt_ref, latent_ref, pred_labels_target, gt_target,latent_target = cross_gae.pred()
+    trained_model = cross_gae.train()
+    pred_labels_ref, gt_ref, latent_ref, pred_labels_target, gt_target, latent_target = cross_gae.pred()
+
+    pred_labels_ref = pred_labels_ref.to(dtype=torch.long)
+    gt_ref = gt_ref.to(dtype=torch.long)
+
+    pred_labels_target = pred_labels_target.to(dtype=torch.long)
+    gt_target = gt_target.to(dtype=torch.long)
+
+    correct_predictions_train = (pred_labels_ref == gt_ref).float()
+    train_accuracy = correct_predictions_train.mean()
+
+    correct_predictions_test = (pred_labels_target == gt_target).float()
+    test_accuracy = correct_predictions_test.mean()
+
+
+    train_accuracy = correct_predictions_train.mean()
+    test_accuracy = correct_predictions_test.mean()
+
+    print(f'Reference Species Prediction Accuracy: {train_accuracy}.')
+    print(f'Target Species Prediction Accuracy: {test_accuracy}.')
+
     np.save(f'{args.savedir}/ref_pred.npy', pred_labels_ref)
     np.save(f'{args.savedir}/ref_gt.npy', gt_ref) 
     np.save(f'{args.savedir}/ref_latent.npy', latent_ref) 

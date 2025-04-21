@@ -7,6 +7,7 @@ from itertools import cycle
 from torch.utils.data import DataLoader, TensorDataset
 from torch_geometric.loader import ClusterData, ClusterLoader
 from tqdm import tqdm
+from plot import *
 import os
 
 class cross_GAE:
@@ -16,7 +17,8 @@ class cross_GAE:
         args.shared_input_dim = dataset.ref_data.homo_x.shape[-1]
         args.ref_input_dim = dataset.ref_data.nonhomo_x.shape[-1]
         args.target_input_dim = dataset.target_data.nonhomo_x.shape[-1]
-        args.num_classes = len(set(dataset.ref_data.y))
+        args.num_classes = torch.unique(dataset.ref_data.y).numel()
+
         self.model = models.cross_GAE(shared_x_dim=args.shared_input_dim, ref_x_dim=args.ref_input_dim, target_x_dim=args.target_input_dim, 
                                       latent_dim = args.latent_dim, shared_hidden_dims = args.shared_hidden_dims, ref_hidden_dims = args.ref_hidden_dims, 
                                        target_hidden_dims = args.target_hidden_dims, GAT_head=args.GAT_head, num_classes=args.num_classes)
@@ -61,57 +63,64 @@ class cross_GAE:
         print('loss: {:.6f}'.format(sum_loss / (batch_idx + 1)))
         print('Reconstruction loss: {:.6f}'.format(sum_loss_recons / (batch_idx + 1)))
         print('Similarity loss: {:.6f}'.format(sum_loss_cls / (batch_idx + 1)*args.beta_cls))
-        print('MMD loss: {:.6f}'.format(sum_loss_cls / (batch_idx + 1)*args.beta_mmd))
+        print('MMD loss: {:.6f}'.format(sum_loss_mmd / (batch_idx + 1)*args.beta_mmd))
 
         del latent_embed_mmd, recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo, ref_logits
         torch.cuda.empty_cache()
         return loss_dict
     
-    def pred(self, dataset):
+    def pred(self):
         self.model.eval()
+
         all_outputs_ref = []
         all_gt_ref = []
         all_latent_ref = []
+
         all_outputs_target = []
         all_gt_target = []
         all_latent_target = []
 
-        ref_data, target_data = dataset.ref_data, dataset.target_data
+        ref_data, target_data = self.dataset.ref_data, self.dataset.target_data
+
         ref_cluster_data = ClusterData(ref_data, num_parts=self.args.batch_size, recursive=False)
-        ref_loader = ClusterLoader(ref_cluster_data, batch_size=1, shuffle=True, num_workers=0)
+        ref_loader = ClusterLoader(ref_cluster_data, batch_size=1, shuffle=False, num_workers=0)
 
         target_cluster_data = ClusterData(target_data, num_parts=self.args.batch_size, recursive=False)
-        target_loader = ClusterLoader(target_cluster_data, batch_size=1, shuffle=True, num_workers=0)
-        target_loader_iter = cycle(target_loader)
+        target_loader = ClusterLoader(target_cluster_data, batch_size=1, shuffle=False, num_workers=0)
 
         with torch.no_grad():
-            for batch_idx, ref_batch in enumerate(ref_loader):
+            # Inference on reference set
+            for ref_batch in tqdm(ref_loader, desc="Predicting Reference"):
                 ref_batch = ref_batch.to(self.args.device)
-                target_batch = next(target_loader_iter)
-                target_batch = target_batch.to(self.args.device)
+                _, ref_latent, _, _, _, _, _, ref_logits, _ = self.model(ref_data=ref_batch)
 
-                # Forward pass
-                ref_latent, target_latent, _, _, _, _, ref_logits, target_logits = self.model(ref_batch, target_batch)
-                
-                # Save logits and label features
                 all_outputs_ref.append(ref_logits.cpu())
-                all_gt_ref.append(ref_batch.y)
-                all_latent_ref.append(ref_latent)
-                all_outputs_target.append(target_logits.cpu())
-                all_gt_target.append(target_batch.y)
-                all_latent_target.append(target_latent)
+                all_gt_ref.append(ref_batch.y.cpu())
+                all_latent_ref.append(ref_latent.cpu())
 
+            # Inference on target set
+            for target_batch in tqdm(target_loader, desc="Predicting Target"):
+                target_batch = target_batch.to(self.args.device)
+                _, _, target_latent, _, _, _, _, _, target_logits = self.model(target_data=target_batch)
+
+                all_outputs_target.append(target_logits.cpu())
+                all_gt_target.append(target_batch.y.cpu())
+                all_latent_target.append(target_latent.cpu())
+
+        # Concatenate all results
         logits_ref = torch.cat(all_outputs_ref, dim=0)
         gt_ref = torch.cat(all_gt_ref, dim=0)
         latent_ref = torch.cat(all_latent_ref, dim=0)
+
         logits_target = torch.cat(all_outputs_target, dim=0)
         gt_target = torch.cat(all_gt_target, dim=0)
         latent_target = torch.cat(all_latent_target, dim=0)
 
+        # Compute predictions
         pred_labels_ref = torch.argmax(logits_ref, dim=1)
         pred_labels_target = torch.argmax(logits_target, dim=1)
 
-        return [pred_labels_ref, gt_ref, latent_ref, pred_labels_target, gt_target,latent_target]
+        return [pred_labels_ref, gt_ref, latent_ref, pred_labels_target, gt_target, latent_target]
 
     def train(self):
         total_losses = []
@@ -129,17 +138,8 @@ class cross_GAE:
 
         plot_dir = self.args.savedir + '/plot'
         os.makedirs(plot_dir, exist_ok=True)
-        plot_separate_loss_curves(cls_losses, recons_losses, mmd_losses, total_losses, saplot_dire_dir)
+        plot_separate_loss_curves(cls_losses, recons_losses, mmd_losses, total_losses, plot_dir)
 
+        return self.model
         
-        pred_labels_ref, ref_gt, latent_ref, pred_labels_target, target_gt, latent_target = self.pred(self.dataset)
-
-        correct_predictions_train = (pred_labels_ref == ref_gt).float()
-        correct_predictions_test = (pred_labels_target == target_gt).float()
-
-        train_accuracy = correct_predictions_train.mean()
-        test_accuracy = correct_predictions_test.mean()
-        
-        model_cpu = self.model.to('cpu')
-        
-        return [pred_labels_ref, ref_gt, train_accuracy, latent_ref, pred_labels_target, target_gt, test_accuracy, latent_target, total_losses, recons_losses, cls_losses, model_cpu]
+        # return [pred_labels_ref, ref_gt, train_accuracy, latent_ref, pred_labels_target, target_gt, test_accuracy, latent_target, total_losses, recons_losses, cls_losses, model_cpu]
