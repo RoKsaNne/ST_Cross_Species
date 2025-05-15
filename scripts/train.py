@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,134 +13,360 @@ import os
 
 class cross_GAE:
     def __init__(self, args, dataset):
+        super().__init__()
         self.args = args
         self.dataset = dataset
+        # input dims
         args.shared_input_dim = dataset.ref_data.homo_x.shape[-1]
-        args.ref_input_dim = dataset.ref_data.nonhomo_x.shape[-1]
+        args.ref_input_dim    = dataset.ref_data.nonhomo_x.shape[-1]
         args.target_input_dim = dataset.target_data.nonhomo_x.shape[-1]
-        args.num_classes = torch.unique(dataset.ref_data.y).numel()
+        args.num_classes      = int(torch.unique(dataset.ref_data.y).numel())
 
-        self.model = models.cross_GAE(shared_x_dim=args.shared_input_dim, ref_x_dim=args.ref_input_dim, target_x_dim=args.target_input_dim, 
-                                      latent_dim = args.latent_dim, shared_hidden_dims = args.shared_hidden_dims, ref_hidden_dims = args.ref_hidden_dims, 
-                                       target_hidden_dims = args.target_hidden_dims, GAT_head=args.GAT_head, num_classes=args.num_classes)
-        self.model = self.model.to(self.args.device)
+        self.model = models.cross_GAE(
+            shared_x_dim=args.shared_input_dim,
+            ref_x_dim=args.ref_input_dim,
+            target_x_dim=args.target_input_dim,
+            hidden_dim=args.hidden_dim,
+            latent_dim=args.latent_dim,
+            GAT_head=args.GAT_head,
+            num_classes=args.num_classes
+        ).to(args.device)
 
-    def train_epoch(self, args, model, device, dataset, optimizer, epoch):
-        model.train()
-        sum_loss, sum_loss_recons, sum_loss_cls, sum_loss_mmd = 0.0, 0.0, 0.0, 0.0
-        ref_data, target_data = dataset.ref_data, dataset.target_data
-
-        ref_cluster_data = ClusterData(ref_data, num_parts=self.args.batch_size, recursive=False)
-        ref_loader = ClusterLoader(ref_cluster_data, batch_size=1, shuffle=True, num_workers=0)
-
-        target_cluster_data = ClusterData(target_data, num_parts=self.args.batch_size, recursive=False)
-        target_loader = ClusterLoader(target_cluster_data, batch_size=1, shuffle=True, num_workers=0)
-
-        target_loader_iter = cycle(target_loader)
+    def train_epoch(self, ref_loader, tgt_loader, optimizer, epoch):
+        self.model.train()
+        sum_loss = sum_recons = sum_cls = sum_mmd = sum_coral = 0.0
         
-        for batch_idx, ref_batch in enumerate(tqdm(ref_loader, desc="Training batches")):
-            ref_batch = ref_batch.to(device)
-            target_batch = next(target_loader_iter)
-            target_batch = target_batch.to(device)
+        ref_loader = ref_loader
+        tgt_iter = cycle(tgt_loader)
+        
+        for idx, ref_batch in enumerate(tqdm(ref_loader, desc="Training")):
+            ref_batch = ref_batch.to(self.args.device)
+            tgt_batch = next(tgt_iter).to(self.args.device)
 
             optimizer.zero_grad()
 
-            latent_embed_mmd, _, _, recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo, ref_logits, _ = model(ref_batch, target_batch)
+            outputs = self.model(ref_data=ref_batch, target_data=tgt_batch)
+            # unpack
+            latent_embed_mmd = {
+                'ref_homo':    outputs['ref_homo_latent'],
+                'ref_nonhomo': outputs['ref_nonhomo_latent'],
+                'target_homo':    outputs.get('target_homo_latent'),
+                'target_nonhomo': outputs.get('target_nonhomo_latent')
+            }
+            recons = outputs['recons']
+            ref_logits = outputs['ref_logits']
+            
 
-            loss_dict = model.loss_function(
-                ref_batch.homo_x, ref_batch.nonhomo_x, target_batch.homo_x, target_batch.nonhomo_x,
-                recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo,
-                latent_embed_mmd, ref_logits, ref_batch.y, args.beta_cls, args.beta_mmd
+
+            # losses
+            loss_dict = self.model.loss_function(
+                ref_batch.homo_x, ref_batch.nonhomo_x,
+                tgt_batch.homo_x, tgt_batch.nonhomo_x,
+                recons['ref_homo'], recons['ref_nonhomo'],
+                recons['tgt_homo'], recons['tgt_nonhomo'],
+                ref_logits, ref_batch.y, 
+                self.args.alpha,
+                self.args.beta_cls, self.args.beta_mmd, self.args.beta_coral
             )
 
-            sum_loss += loss_dict['loss']
-            sum_loss_recons += loss_dict['Reconstruction_Loss']
-            sum_loss_cls += loss_dict['Classification_Loss']
-            sum_loss_mmd += loss_dict['MMD_Loss']
+            sum_loss   += loss_dict['loss'].item()
+            sum_recons += loss_dict['Reconstruction_Loss'].item()
+            sum_cls    += loss_dict['Classification_Loss'].item()
+            sum_mmd    += loss_dict['MMD_Loss'].item()
+            sum_coral    += loss_dict['CORAL_Loss'].item()
 
             loss_dict['loss'].backward()
             optimizer.step()
-        print(f'Epoch {epoch}:')
-        print('loss: {:.6f}'.format(sum_loss / (batch_idx + 1)))
-        print('Reconstruction loss: {:.6f}'.format(sum_loss_recons / (batch_idx + 1)))
-        print('Similarity loss: {:.6f}'.format(sum_loss_cls / (batch_idx + 1)*args.beta_cls))
-        print('MMD loss: {:.6f}'.format(sum_loss_mmd / (batch_idx + 1)*args.beta_mmd))
 
-        del latent_embed_mmd, recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo, ref_logits
+        print(f"Epoch {epoch}: loss={sum_loss/(idx+1):.4f}, "
+              f"recons={sum_recons/(idx+1)*self.args.alpha:.4f}, "
+              f"cls={sum_cls/(idx+1)*self.args.beta_cls:.4f}, "
+              f"mmd={sum_mmd/(idx+1)*self.args.beta_mmd:.4f}, "
+              f"coral={sum_coral/(idx+1)*self.args.beta_coral:.4f}")
+
         torch.cuda.empty_cache()
         return loss_dict
     
-    def pred(self):
+    def pred(self, ref_loader, tgt_loader):
         self.model.eval()
+        ref_data, tgt_data = self.dataset.ref_data, self.dataset.target_data
 
-        all_outputs_ref = []
-        all_gt_ref = []
-        all_latent_ref = []
+        # ref_loader = ClusterLoader(ClusterData(ref_data, num_parts=self.args.batch_size, recursive=False),
+        #                            batch_size=1, shuffle=False)
+        # tgt_loader = ClusterLoader(ClusterData(tgt_data, num_parts=self.args.batch_size, recursive=False),
+        #                            batch_size=1, shuffle=False)
 
-        all_outputs_target = []
-        all_gt_target = []
-        all_latent_target = []
+        all_ref_logits = []
+        all_ref_y      = []
+        all_ref_latent = []
+        all_ref_latent_homo = []
+        all_ref_recon_homo = []
+        all_ref_recon_nonhomo = []
 
-        ref_data, target_data = self.dataset.ref_data, self.dataset.target_data
-
-        ref_cluster_data = ClusterData(ref_data, num_parts=self.args.batch_size, recursive=False)
-        ref_loader = ClusterLoader(ref_cluster_data, batch_size=1, shuffle=False, num_workers=0)
-
-        target_cluster_data = ClusterData(target_data, num_parts=self.args.batch_size, recursive=False)
-        target_loader = ClusterLoader(target_cluster_data, batch_size=1, shuffle=False, num_workers=0)
+        all_tgt_logits = []
+        all_tgt_y      = []
+        all_tgt_latent = []
+        all_tgt_latent_homo = []
+        all_tgt_recon_homo = []
+        all_tgt_recon_nonhomo = []
 
         with torch.no_grad():
-            # Inference on reference set
-            for ref_batch in tqdm(ref_loader, desc="Predicting Reference"):
-                ref_batch = ref_batch.to(self.args.device)
-                _, ref_latent, _, _, _, _, _, ref_logits, _ = self.model(ref_data=ref_batch)
+            # reference
+            for batch in tqdm(ref_loader, desc="Predict Ref"):
+                batch = batch.to(self.args.device)
+                out = self.model(ref_data=batch)
+                # collect
+                all_ref_logits.append(out['ref_logits'].cpu())
+                all_ref_y.append(batch.y.cpu())
+                latent = torch.cat([out['ref_homo_latent'], out['ref_nonhomo_latent']], dim=1)
+                all_ref_latent.append(latent.cpu())
+                all_ref_latent_homo.append(out['ref_homo_latent'].cpu())
+            # target
+            for batch in tqdm(tgt_loader, desc="Predict Tgt"):
+                batch = batch.to(self.args.device)
+                out = self.model(target_data=batch)
+                all_tgt_logits.append(out['target_logits'].cpu())
+                all_tgt_y.append(batch.y.cpu())
+                latent = torch.cat([out['target_homo_latent'], out['target_nonhomo_latent']], dim=1)
+                all_tgt_latent.append(latent.cpu())
+                all_tgt_latent_homo.append(out['target_homo_latent'].cpu())
 
-                all_outputs_ref.append(ref_logits.cpu())
-                all_gt_ref.append(ref_batch.y.cpu())
-                all_latent_ref.append(ref_latent.cpu())
+        # stack
+        logits_ref   = torch.cat(all_ref_logits)
+        y_ref        = torch.cat(all_ref_y)
+        latent_ref   = torch.cat(all_ref_latent)
+        latent_ref_homo   = torch.cat(all_ref_latent_homo)
 
-            # Inference on target set
-            for target_batch in tqdm(target_loader, desc="Predicting Target"):
-                target_batch = target_batch.to(self.args.device)
-                _, _, target_latent, _, _, _, _, _, target_logits = self.model(target_data=target_batch)
+        logits_tgt   = torch.cat(all_tgt_logits)
+        y_tgt        = torch.cat(all_tgt_y)
+        latent_tgt   = torch.cat(all_tgt_latent)
+        latent_tgt_homo   = torch.cat(all_tgt_latent_homo)
 
-                all_outputs_target.append(target_logits.cpu())
-                all_gt_target.append(target_batch.y.cpu())
-                all_latent_target.append(target_latent.cpu())
+        # save reconstructions
+        save_dir = self.args.savedir
+        os.makedirs(save_dir, exist_ok=True)
 
-        # Concatenate all results
-        logits_ref = torch.cat(all_outputs_ref, dim=0)
-        gt_ref = torch.cat(all_gt_ref, dim=0)
-        latent_ref = torch.cat(all_latent_ref, dim=0)
+        np.save(os.path.join(save_dir, 'ref_latent_homo.npy'), latent_ref_homo)
+        np.save(os.path.join(save_dir, 'tgt_latent_homo.npy'), latent_tgt_homo)
 
-        logits_target = torch.cat(all_outputs_target, dim=0)
-        gt_target = torch.cat(all_gt_target, dim=0)
-        latent_target = torch.cat(all_latent_target, dim=0)
+        # predictions
+        preds_ref = torch.argmax(F.softmax(logits_ref, dim=1), dim=1)
+        preds_tgt = torch.argmax(F.softmax(logits_tgt, dim=1), dim=1)
 
-        # Compute predictions
-        pred_labels_ref = torch.argmax(logits_ref, dim=1)
-        pred_labels_target = torch.argmax(logits_target, dim=1)
+        acc_ref = (preds_ref == y_ref).float().mean()
+        acc_tgt = (preds_tgt == y_tgt).float().mean()
+        print(f"Ref Acc: {acc_ref:.4f}, Tgt Acc: {acc_tgt:.4f}")
 
-        return [pred_labels_ref, gt_ref, latent_ref, pred_labels_target, gt_target, latent_target]
+        return preds_ref, y_ref, latent_ref, preds_tgt, y_tgt, latent_tgt
 
     def train(self):
-        total_losses = []
-        recons_losses = []
-        cls_losses = []
-        mmd_losses = []
-        
-        optimizer = optim.Adam(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.wd)
-        for epoch in range(self.args.epochs):
-            loss_dict = self.train_epoch(self.args, self.model, self.args.device, self.dataset, optimizer, epoch)
-            total_losses.append(loss_dict['loss'].item())
-            recons_losses.append(loss_dict['Reconstruction_Loss'].item())
-            cls_losses.append(loss_dict['Classification_Loss'].item())
-            mmd_losses.append(loss_dict['MMD_Loss'].item())
+        optimizer = optim.Adam(self.model.parameters(),
+                               lr=self.args.lr,
+                               weight_decay=self.args.wd)
+        optimizer = optim.AdamW(self.model.parameters(), lr=self.args.lr)
 
-        plot_dir = self.args.savedir + '/plot'
+        # initialize history
+        # losses = {'total':[], 'recons':[], 'cls':[], 'mmd':[]}
+        overall_losses = {}
+        acc_ref_list = []
+        acc_tgt_list = []
+
+        ref_data, tgt_data = self.dataset.ref_data, self.dataset.target_data
+        ref_loader = ClusterLoader(ClusterData(ref_data,
+                               num_parts=self.args.batch_size,
+                               recursive=False),
+                                   batch_size=1, shuffle=True)
+        tgt_loader = ClusterLoader(ClusterData(tgt_data,
+                               num_parts=self.args.batch_size,
+                               recursive=False),
+                                   batch_size=1, shuffle=True)
+
+        for ep in range(self.args.epochs):
+            # one epoch of training
+            ld = self.train_epoch(ref_loader, tgt_loader, optimizer, ep)
+
+            # record losses
+            # losses['total'].append(ld['loss'].item())
+            # losses['recons'].append(ld['Reconstruction_Loss'].item())
+            # losses['cls'].append(ld['Classification_Loss'].item())
+            # losses['mmd'].append(ld['MMD_Loss'].item())
+            for loss_name, loss_value in ld.items():
+                # If this loss term is already in the dictionary, append the value
+                if loss_name not in overall_losses:
+                    overall_losses[loss_name] = []
+                overall_losses[loss_name].append(loss_value.item())
+
+            # run prediction & compute accuracies
+            preds_ref, y_ref, _, preds_tgt, y_tgt, _, _, _, _, _, _, _ = self.pred(ref_loader, tgt_loader)
+            acc_ref = (preds_ref == y_ref).float().mean().item()
+            acc_tgt = (preds_tgt == y_tgt).float().mean().item()
+            acc_ref_list.append(acc_ref)
+            acc_tgt_list.append(acc_tgt)
+
+        # make sure output directory for plots exists
+        plot_dir = os.path.join(self.args.savedir, 'plot')
         os.makedirs(plot_dir, exist_ok=True)
-        plot_separate_loss_curves(cls_losses, recons_losses, mmd_losses, total_losses, plot_dir)
 
-        return self.model
+        # plot losses
+        plot_separate_loss_curves(
+            overall_losses,
+            plot_dir
+        )
+
+        # plot accuracies
+        plot_acc_curves(
+            acc_ref_list,
+            acc_tgt_list,
+            plot_dir
+        )
+
+        return overall_losses
+
+class cross_GAE_VAE(cross_GAE):
+    def __init__(
+        self,
+        args,
+        dataset
+    ):
+        super().__init__(args, dataset)
+        self.model = models.cross_GAE_VAE(
+            shared_x_dim=args.shared_input_dim,
+            ref_x_dim=args.ref_input_dim,
+            target_x_dim=args.target_input_dim,
+            hidden_dim=args.hidden_dim,
+            latent_dim=args.latent_dim,
+            GAT_head=args.GAT_head,
+            num_classes=args.num_classes,
+            condition=args.condition,
+            denoise=args.denoise
+        ).to(args.device)
+
+    def train_epoch(self, ref_loader, tgt_loader, optimizer, epoch):
+        self.model.train()
+        sum_loss = sum_recons = sum_cls = sum_mmd = sum_coral = sum_kl =  0.0
+
+        ref_loader = ref_loader
+        tgt_iter = cycle(tgt_loader)
+
+        for idx, ref_batch in enumerate(tqdm(ref_loader, desc="Training")):
+            ref_batch = ref_batch.to(self.args.device)
+            tgt_batch = next(tgt_iter).to(self.args.device)
+
+            optimizer.zero_grad()
+
+            outputs = self.model(ref_data=ref_batch, target_data=tgt_batch)
+            recons = outputs['recons']
+            ref_logits = outputs['ref_logits']
+            tgt_logits = outputs['target_logits']
+
+            # losses
+            loss_dict = self.model.loss_function(
+                ref_batch.homo_x, ref_batch.nonhomo_x,
+                tgt_batch.homo_x, tgt_batch.nonhomo_x,
+                outputs['latent'], ref_logits, ref_batch.y,
+                self.args.alpha,
+                self.args.beta_cls, self.args.beta_mmd, self.args.beta_coral, self.args.beta_kl,
+                tgt_logits, self.args.condition
+            )
+
+            sum_loss   += loss_dict['loss'].item()
+            sum_recons += loss_dict['Reconstruction_Loss'].item()
+            sum_cls    += loss_dict['Classification_Loss'].item()
+            sum_mmd    += loss_dict['MMD_Loss'].item()
+            sum_coral  += loss_dict['CORAL_Loss'].item()
+            sum_kl  += loss_dict['KL_Loss'].item()
+
+            loss_dict['loss'].backward()
+            optimizer.step()
+
+        print(f"Epoch {epoch}: loss={sum_loss/(idx+1):.4f}, "
+            f"recons={sum_recons/(idx+1)*self.args.alpha:.4f}, "
+            f"cls={sum_cls/(idx+1)*self.args.beta_cls:.4f}, "
+            f"mmd={sum_mmd/(idx+1)*self.args.beta_mmd:.4f}, "
+            f"coral={sum_coral/(idx+1)*self.args.beta_coral:.4f}, "
+            f"kl={sum_kl/(idx+1)*self.args.beta_kl:.4f}")
         
-        # return [pred_labels_ref, ref_gt, train_accuracy, latent_ref, pred_labels_target, target_gt, test_accuracy, latent_target, total_losses, recons_losses, cls_losses, model_cpu]
+        torch.cuda.empty_cache()
+        return loss_dict
+
+    def pred(self, ref_loader, tgt_loader):
+        self.model.eval()
+        ref_data, tgt_data = self.dataset.ref_data, self.dataset.target_data
+
+        # ref_loader = ClusterLoader(ClusterData(ref_data, num_parts=self.args.batch_size, recursive=False),
+        #                            batch_size=1, shuffle=False)
+        # tgt_loader = ClusterLoader(ClusterData(tgt_data, num_parts=self.args.batch_size, recursive=False),
+        #                            batch_size=1, shuffle=False)
+
+        all_ref_logits = []
+        all_ref_y      = []
+        all_ref_latent = []
+        all_ref_latent_homo = []
+        all_ref_recon_homo = []
+        all_ref_recon_nonhomo = []
+        all_ref_mean_homo = []
+        all_ref_mean_nonhomo = []
+
+        all_tgt_logits = []
+        all_tgt_y      = []
+        all_tgt_latent = []
+        all_tgt_latent_homo = []
+        all_tgt_recon_homo = []
+        all_tgt_recon_nonhomo = []
+        all_tgt_mean_homo = []
+        all_tgt_mean_nonhomo = []
+
+        with torch.no_grad():
+            # reference
+            for batch in tqdm(ref_loader, desc="Predict Ref"):
+                batch = batch.to(self.args.device)
+                out = self.model(ref_data=batch)
+                # collect
+                all_ref_logits.append(out['ref_logits'].cpu())
+                all_ref_y.append(batch.y.cpu())
+                latent = torch.cat([out['latent']['ref_homo_latent'], out['latent']['ref_nonhomo_latent']], dim=1)
+                all_ref_latent.append(latent.cpu())
+                all_ref_latent_homo.append(out['latent']['ref_homo_latent'].cpu())
+
+                all_ref_mean_homo.append(out['latent']['ref_homo_mean'].cpu())
+                all_ref_mean_nonhomo.append(out['latent']['ref_nonhomo_mean'].cpu())
+                
+
+            # target
+            for batch in tqdm(tgt_loader, desc="Predict Tgt"):
+                batch = batch.to(self.args.device)
+                out = self.model(target_data=batch)
+                all_tgt_logits.append(out['target_logits'].cpu())
+                all_tgt_y.append(batch.y.cpu())
+                latent = torch.cat([out['latent']['target_homo_latent'], out['latent']['target_nonhomo_latent']], dim=1)
+                all_tgt_latent.append(latent.cpu())
+                all_tgt_latent_homo.append(out['latent']['target_homo_latent'].cpu())
+
+                all_tgt_mean_homo.append(out['latent']['target_homo_mean'].cpu())
+                all_tgt_mean_nonhomo.append(out['latent']['target_nonhomo_mean'].cpu())
+
+        # stack
+        logits_ref   = torch.cat(all_ref_logits)
+        y_ref        = torch.cat(all_ref_y)
+        latent_ref   = torch.cat(all_ref_latent)
+        latent_ref_homo   = torch.cat(all_ref_latent_homo)
+        ref_homo_mean   = torch.cat(all_ref_mean_homo)
+        ref_nonhomo_mean   = torch.cat(all_ref_mean_nonhomo)
+
+        logits_tgt   = torch.cat(all_tgt_logits)
+        y_tgt        = torch.cat(all_tgt_y)
+        latent_tgt   = torch.cat(all_tgt_latent)
+        latent_tgt_homo   = torch.cat(all_tgt_latent_homo)
+        tgt_homo_mean   = torch.cat(all_tgt_mean_homo)
+        tgt_nonhomo_mean   = torch.cat(all_tgt_mean_nonhomo)
+        
+
+        # predictions
+        preds_ref = torch.argmax(F.softmax(logits_ref, dim=1), dim=1)
+        preds_tgt = torch.argmax(F.softmax(logits_tgt, dim=1), dim=1)
+
+        acc_ref = (preds_ref == y_ref).float().mean()
+        acc_tgt = (preds_tgt == y_tgt).float().mean()
+        print(f"Ref Acc: {acc_ref:.4f}, Tgt Acc: {acc_tgt:.4f}")
+
+        return preds_ref, y_ref, latent_ref, preds_tgt, y_tgt, latent_tgt, latent_ref_homo, latent_tgt_homo, ref_homo_mean, ref_nonhomo_mean, tgt_homo_mean, tgt_nonhomo_mean

@@ -2,19 +2,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
-from torch_geometric.nn import GATv2Conv
+# from torch_geometric.nn import GATv2Conv
+from gat_conv import GATConv
 from typing import List, Callable, Union, Any, TypeVar, Tuple
 from .loss import *
 
 class GATBlock(nn.Module):
     def __init__(self, in_dim, out_dim, heads):
         super().__init__()
-        self.gat = GATv2Conv(in_dim, out_dim, heads=heads)
-        self.act = nn.ReLU()
+        self.encoder_gat1 = GATConv(input_dim, num_hidden, heads=1, concat=False,
+                                    dropout=0.1, add_self_loops=False, bias=False)
+        self.encoder_gat2 = GATConv(num_hidden, out_dim, heads=1, concat=False,
+                                    dropout=0, add_self_loops=False, bias=False)
 
-    def forward(self, x, edge_index):
-        x = self.gat(x, edge_index)
-        return self.act(x)
+        self.decoder_gat1 = GATConv(out_dim, num_hidden, heads=1, concat=False,
+                                    dropout=0, add_self_loops=False, bias=False)
+        self.decoder_gat2 = GATConv(num_hidden, input_dim, heads=1, concat=False,
+                                    dropout=0.1, add_self_loops=False, bias=False)
+
+    def forward(self, features, edge_index):
+
+        h1 = F.relu(self.encoder_gat1(features, edge_index))
+        latent = self.encoder_gat2(h1, edge_index, attention=False)
+        
+        self.decoder_gat1.lin_src.data = self.encoder_gat2.lin_src.transpose(0, 1)
+        self.decoder_gat1.lin_dst.data = self.encoder_gat2.lin_dst.transpose(0, 1)
+        self.decoder_gat2.lin_src.data = self.encoder_gat1.lin_src.transpose(0, 1)
+        self.decoder_gat2.lin_dst.data = self.encoder_gat1.lin_dst.transpose(0, 1)
+        
+        h3 = F.relu(self.decoder_gat1(latent, edge_index, attention=True,
+                                     tied_attention=self.encoder_gat1.attentions))
+        reconstructed = self.decoder_gat2(h3, edge_index, attention=False)
+
+        return latent, reconstructed
 
 class cross_GAE(nn.Module):
     def __init__(self, shared_x_dim: int, ref_x_dim: int, target_x_dim: int, latent_dim: int, shared_hidden_dims: List = None, ref_hidden_dims: List = None, target_hidden_dims: List = None, GAT_head:int=4, num_classes: int=None):
@@ -112,9 +132,10 @@ class cross_GAE(nn.Module):
 
         ### Classifier
         self.classifier = nn.Sequential(
-            nn.Linear(self.latent_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.num_classes)
+            # nn.Linear(self.latent_dim, 64),
+            # nn.ReLU(),
+            # nn.Linear(64, self.num_classes)
+            nn.Linear(self.latent_dim, self.num_classes)
         )
 
 
@@ -164,7 +185,7 @@ class cross_GAE(nn.Module):
         # ref_latent = self.decoder_linear_ref(ref_latent)
         # target_latent = self.decoder_linear_target(target_latent)
         ref_latent = self.decoder_linear_ref(ref_latent)
-        target_latent = self.decoder_linear_ref(target_latent)
+        target_latent = self.decoder_linear_target(target_latent)
 
         return latent_embed_mmd, ref_latent, target_latent
     
@@ -200,20 +221,6 @@ class cross_GAE(nn.Module):
 
         return ref_homo, ref_nonhomo, target_homo, target_nonhomo
 
-    # def forward(self, ref_data, target_data):
-    #     ref_homo, ref_nonhomo, ref_edge = ref_data.homo_x, ref_data.nonhomo_x, ref_data.edge_index
-    #     target_homo, target_nonhomo, target_edge = target_data.homo_x, target_data.nonhomo_x, target_data.edge_index
-
-    #     latent_embed_mmd, ref_latent, target_latent = self.encode(ref_homo, target_homo, ref_nonhomo, target_nonhomo, ref_edge, target_edge)
-    #     recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo = self.decode_recons(ref_latent, target_latent, ref_edge, target_edge)
-    #     ref_logits = self.classifier(ref_latent)
-    #     target_logits = self.classifier(target_latent)
-
-    #     # not needed for now, but maybe later
-    #     recons_ref = torch.cat([recons_ref_homo, recons_ref_nonhomo], dim=1)
-    #     recons_target = torch.cat([recons_target_homo, recons_target_nonhomo], dim=1)
-        
-    #     return  [latent_embed_mmd, ref_latent, target_latent, recons_ref_homo, recons_ref_nonhomo, recons_target_homo, recons_target_nonhomo, ref_logits, target_logits]
     def forward(self, ref_data=None, target_data=None):
         latent_embed_mmd = {}
         ref_latent = target_latent = None
@@ -228,6 +235,8 @@ class cross_GAE(nn.Module):
                 self.encoder_ref, self.linear_ref
             )
             latent_embed_mmd['ref_homo'] = ref_homo_latent
+
+
             latent_embed_mmd['ref_nonhomo'] = ref_nonhomo_latent
 
             recons_ref_homo, recons_ref_nonhomo = self._decode_side(
@@ -333,14 +342,22 @@ class cross_GAE(nn.Module):
         # Loss Weight
         beta_cls = args[11]
         beta_mmd = args[12]
+        alpha = args[13]
         
         ### Compute Loss
         recons_loss = F.mse_loss(ref_homo, recons_ref_homo) + F.mse_loss(ref_nonhomo, recons_ref_nonhomo)+ F.mse_loss(target_homo, recons_target_homo) + F.mse_loss(target_nonhomo, recons_target_nonhomo)
-        classifier_loss = F.cross_entropy(ref_logits, ref_y)
+        
+        # replace the cls loss witht the version consider the class weights
+        class_counts = torch.bincount(ref_y)
+        class_weights = 1.0 / (class_counts.float() + 1e-8)
+        class_weights = class_weights / class_weights.sum() * len(class_counts)
+        classifier_loss = F.cross_entropy(ref_logits, ref_y, weight=class_weights.to(ref_logits.device))
+        
+        # classifier_loss = F.cross_entropy(ref_logits, ref_y)
         # TODO: MMD loss for ref and target may also be hyper parameters
         mmd_loss = mmd(ref_homo_latent, ref_nonhomo_latent) + mmd(target_homo_latent, target_nonhomo_latent)
 
-        loss = torch.mean(recons_loss + beta_cls*classifier_loss + beta_mmd*mmd_loss)
+        loss = torch.mean(alpha*recons_loss + beta_cls*classifier_loss + beta_mmd*mmd_loss)
         return {'loss': loss, 'Reconstruction_Loss':recons_loss.detach(),  "Classification_Loss": classifier_loss.detach(), "MMD_Loss": mmd_loss.detach()}
 
 

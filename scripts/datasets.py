@@ -1,273 +1,295 @@
-
+import os
 import torch
 import numpy as np
-from torch_geometric.data import InMemoryDataset, Data
-from sklearn.metrics import pairwise_distances
 import pandas as pd
 import scanpy as sc
-from collections import Counter
+from sklearn.metrics import pairwise_distances
+from torch_geometric.data import Data
+from torch.utils.data import Dataset, DataLoader
 from preprocess import preprocess
+import sklearn.neighbors
+import scipy.sparse as sp
 
-def get_edge_index_standard(pos, distance_thres):
-    # construct edge indexes in one region
-    edge_list = []
+def get_edge_index_standard(pos: np.ndarray, distance_thres: float):
+    """
+    Construct edge index based on pairwise Euclidean distance threshold.
+    pos: (N, D) numpy array of coordinates
+    distance_thres: connect if dist < threshold
+    Returns: list of [i, j] edges
+    """
     dists = pairwise_distances(pos)
-    dists_mask = dists < distance_thres
-    np.fill_diagonal(dists_mask, 0)
-    edge_list = np.transpose(np.nonzero(dists_mask)).tolist()
-    return edge_list
+    mask = (dists < distance_thres)
+    np.fill_diagonal(mask, False)
+    edges = np.transpose(np.nonzero(mask))
+    return edges.tolist()
 
-def get_edge_index_standard_region(pos, regions, distance_thres):
-    # construct edge indexes when there is region information
-    edge_list = []
-    regions_unique = np.unique(regions)
-    for reg in regions_unique:
-        locs = np.where(regions == reg)[0]
-        pos_region = pos[locs, :]
-        dists = pairwise_distances(pos_region)
-        dists_mask = dists < distance_thres
-        np.fill_diagonal(dists_mask, 0)
-        region_edge_list = np.transpose(np.nonzero(dists_mask)).tolist()
-        for (i, j) in region_edge_list:
-            edge_list.append([locs[i], locs[j]])
-    return edge_list
 
-def filter_adata(adata):
-    adata.var["mt"] = adata.var_names.str.startswith("MT-")
-    sc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], percent_top=None, inplace=True, log1p=False)
-    percent_mito = 5
-    filter_mincells = 3
-    filter_mingenes = 200
+def get_edge_index_standard_region(pos: np.ndarray, regions: np.ndarray, distance_thres: float):
+    """
+    Same as get_edge_index_standard but only connecting within the same region.
+    regions: (N,) array of region labels
+    """
+    edges = []
+    for reg in np.unique(regions):
+        idx = np.where(regions == reg)[0]
+        subpos = pos[idx]
+        d = pairwise_distances(subpos)
+        m = (d < distance_thres)
+        np.fill_diagonal(m, False)
+        subedges = np.transpose(np.nonzero(m))
+        for i, j in subedges:
+            edges.append([idx[i], idx[j]])
+    return edges
 
-    adata = adata[adata.obs["n_genes_by_counts"] > filter_mingenes, :].copy()
-    adata = adata[adata.obs["pct_counts_mt"] < percent_mito, :].copy()
-    adata = adata[:, adata.var["n_cells_by_counts"] > filter_mincells].copy()
 
+def prepare_graph_data(adj):
+    # adapted from STAGATE
+
+    # adapted from preprocess_adj_bias
+    num_nodes = adj.shape[0]
+    adj = adj + sp.eye(num_nodes)# self-loop
+    #data =  adj.tocoo().data
+    #adj[adj > 0.0] = 1.0
+    if not sp.isspmatrix_coo(adj):
+        adj = adj.tocoo()
+    adj = adj.astype(np.float32)
+    indices = np.vstack((adj.col, adj.row)).transpose()
+    return (indices, adj.data, adj.shape)
+
+
+def Cal_Spatial_Net(adata, rad_cutoff=None, k_cutoff=None, model='Radius', verbose=True):
+    # adapted from STAGATE
+    """\
+    Construct the spatial neighbor networks.
+
+    Parameters
+    ----------
+    adata
+        AnnData object of scanpy package.
+    rad_cutoff
+        radius cutoff when model='Radius'
+    k_cutoff
+        The number of nearest neighbors when model='KNN'
+    model
+        The network construction model. When model=='Radius', the spot is connected to spots whose distance is less than rad_cutoff. When model=='KNN', the spot is connected to its first k_cutoff nearest neighbors.
+    
+    Returns
+    -------
+    The spatial networks are saved in adata.uns['Spatial_Net']
+    """
+
+    assert(model in ['Radius', 'KNN'])
+    if verbose:
+        print('------Calculating spatial graph...')
+    coor = pd.DataFrame(adata.obsm['spatial'])
+    coor.index = adata.obs.index
+    coor.columns = ['imagerow', 'imagecol']
+
+    if model == 'Radius':
+        nbrs = sklearn.neighbors.NearestNeighbors(radius=rad_cutoff).fit(coor)
+        distances, indices = nbrs.radius_neighbors(coor, return_distance=True)
+        KNN_list = []
+        for it in range(indices.shape[0]):
+            KNN_list.append(pd.DataFrame(zip([it]*indices[it].shape[0], indices[it], distances[it])))
+    
+    if model == 'KNN':
+        nbrs = sklearn.neighbors.NearestNeighbors(n_neighbors=k_cutoff+1).fit(coor)
+        distances, indices = nbrs.kneighbors(coor)
+        KNN_list = []
+        for it in range(indices.shape[0]):
+            KNN_list.append(pd.DataFrame(zip([it]*indices.shape[1],indices[it,:], distances[it,:])))
+
+    KNN_df = pd.concat(KNN_list)
+    KNN_df.columns = ['Cell1', 'Cell2', 'Distance']
+
+    Spatial_Net = KNN_df.copy()
+    Spatial_Net = Spatial_Net.loc[Spatial_Net['Distance']>0,]
+    id_cell_trans = dict(zip(range(coor.shape[0]), np.array(coor.index), ))
+    Spatial_Net['Cell1'] = Spatial_Net['Cell1'].map(id_cell_trans)
+    Spatial_Net['Cell2'] = Spatial_Net['Cell2'].map(id_cell_trans)
+    if verbose:
+        print('The graph contains %d edges, %d cells.' %(Spatial_Net.shape[0], adata.n_obs))
+        print('%.4f neighbors per cell on average.' %(Spatial_Net.shape[0]/adata.n_obs))
+
+    adata.uns['Spatial_Net'] = Spatial_Net
+
+def get_edge_index_knn(adata, k):
+    Cal_Spatial_Net(adata, k_cutoff=k, model='KNN')
+    Spatial_Net = adata.uns['Spatial_Net']
+    cells = adata.obs.index
+    cells_id_tran = dict(zip(cells, range(cells.shape[0])))
+    G_df = Spatial_Net.copy()
+    G_df['Cell1'] = G_df['Cell1'].map(cells_id_tran)
+    G_df['Cell2'] = G_df['Cell2'].map(cells_id_tran)
+    G = sp.coo_matrix((np.ones(G_df.shape[0]), (G_df['Cell1'], G_df['Cell2'])), shape=(adata.n_obs, adata.n_obs))
+    G_tf = prepare_graph_data(G)
+    print(G_tf)
+    return G_tf[0]
+
+
+def filter_adata(adata: sc.AnnData) -> sc.AnnData:
+    """
+    Basic QC filtering: remove cells with high mitochondrial %, low genes, and genes in few cells.
+    """
+    adata.var['mt'] = adata.var_names.str.startswith('MT-')
+    sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], inplace=True)
+    adata = adata[adata.obs['n_genes_by_counts'] > 200, :]
+    adata = adata[adata.obs['pct_counts_mt'] < 5, :]
+    adata = adata[:, adata.var['n_cells_by_counts'] > 3]
     return adata
 
-def read_dataset(ref_path, target_path, species1, species2):
-    species1_adata = sc.read_h5ad(ref_path)
-    species2_adata = sc.read_h5ad(target_path)
 
-    species1_adata = filter_adata(species1_adata)
-    species2_adata = filter_adata(species2_adata)
+def read_dataset(ref_path: str, target_path: str, species1: str, species2: str, skip_QC=False):
+    """
+    Load and QC filter two AnnData objects, assign deconvolution-based cell types.
+    Returns: species1_adata, species2_adata, homo_genes_df
+    """
+    ad1 = sc.read_h5ad(ref_path)
+    ad2 = sc.read_h5ad(target_path)
+    if not skip_QC:
+        ad1 = filter_adata(ad1)
+        ad2 = filter_adata(ad2)
 
-    # assign the deconvolution probability to cell_type
-    # TODO: Hardcode cell type columns, edit in future
-    species2_cell_prob = species2_adata.obs.iloc[:,10:24]
-    print(species2_cell_prob.columns)
-    species2_cell_prob['cell_type'] = species2_cell_prob.idxmax(axis=1)
-    species2_adata.obs['cell_type'] = species2_cell_prob['cell_type']
-    species1_cell_prob = species1_adata.obs.iloc[:,10:28]
-    print(species1_cell_prob.columns)
-    species1_cell_prob['cell_type'] = species1_cell_prob.idxmax(axis=1)
-    species1_adata.obs['cell_type'] = species1_cell_prob['cell_type']
 
-    homo_genes_df = pd.read_csv(f'/oscar/data/yma16/Project/Cross_species/data/homolog_genes/{species1}_{species2}.tsv', sep='\t')
-    return species1_adata, species2_adata, homo_genes_df
+    # # assume deconv probs in obs columns 10:24 and 10:28 respectively
+    # prob2 = ad2.obs.iloc[:, 10:24]
+    # prob2['cell_type'] = prob2.idxmax(axis=1)
+    # ad2.obs['cell_type'] = prob2['cell_type']
+    # prob1 = ad1.obs.iloc[:, 10:28]
+    # prob1['cell_type'] = prob1.idxmax(axis=1)
+    # ad1.obs['cell_type'] = prob1['cell_type']
 
-# def load_dataset(args, adata_ref, adata_target, species1, species2, homo_genes_df, distance_thres_ref, distance_thres_target, celltype_name_ref, celltype_name_target, loc_name_ref, loc_name_target, region_name_ref=None, region_name_target=None):
+    tsv = f'/oscar/data/yma16/Project/Cross_species/00_Data/homolog_genes/{species1}_{species2}.tsv'
+    homo_df = pd.read_csv(tsv, sep='\t')
+    return ad1, ad2, homo_df
+
+
+def extract_and_preprocess_data(args, ad1, ad2, species1: str, species2: str, homo_df: pd.DataFrame, homo_gene_id: str):
+    """
+    Subset AnnData to homologous vs non-homologous genes and preprocess.
+    Returns: four AnnData: ref_homo, ref_nonhomo, tgt_homo, tgt_nonhomo
+    plus valid_pairs list.
+    """
+    genes1 = homo_df[homo_gene_id]
+    lowered = homo_gene_id[0].lower() + homo_gene_id[1:]
+    genes2 = homo_df[f'{species2} {lowered}']
+    pairs = [(g1, g2) for g1, g2 in zip(genes1, genes2)
+             if g1 in ad1.var_names and g2 in ad2.var_names]
+    ref_homo = ad1[:, [p[0] for p in pairs]].copy()
+    ref_homo = ref_homo[:, ~ref_homo.var_names.duplicated()]
+    ref_non = ad1[:, ~ad1.var_names.isin([p[0] for p in pairs])].copy()
+    tgt_homo = ad2[:, [p[1] for p in pairs]].copy()
+    tgt_homo = tgt_homo[:, ~tgt_homo.var_names.duplicated()]
+    tgt_non = ad2[:, ~ad2.var_names.isin([p[1] for p in pairs])].copy()
+
+    return preprocess(
+        args, ref_homo, ref_non,
+        tgt_homo, tgt_non, pairs
+    )
+
+
+
+def load_dataset(
+    args,
+    ad_ref_homo, ad_ref_non,
+    ad_tgt_homo, ad_tgt_non,
+    k_ref: int, k_tgt: int,
+    ct_ref: str, ct_tgt: str,
+    loc_ref: str, loc_tgt: str,
+    region_ref: str = None, region_tgt: str = None,
+    identity_graph: bool = False
+):
+    """
+    Build PyG Data objects for reference and target graphs.
+    If identity_graph=True, only self-loops will be created (no neighborhood edges).
+    Returns GraphDataset, inverse label dicts.
+    """
+    # Data matrices
+    Xrh = ad_ref_homo.X.toarray() if hasattr(ad_ref_homo.X, 'toarray') else ad_ref_homo.X
+    Xrn = ad_ref_non.X.toarray() if hasattr(ad_ref_non.X, 'toarray') else ad_ref_non.X
+    Xth = ad_tgt_homo.X.toarray() if hasattr(ad_tgt_homo.X, 'toarray') else ad_tgt_homo.X
+    Xtn = ad_tgt_non.X.toarray() if hasattr(ad_tgt_non.X, 'toarray') else ad_tgt_non.X
+
+    # Labels
+    y1_raw = ad_ref_homo.obs[ct_ref].str.lower().values
+    types1 = sorted(np.unique(y1_raw))
+    d1 = {t: i for i, t in enumerate(types1)}
+    y1 = np.array([d1[c] for c in y1_raw])
+
+    y2_raw = ad_tgt_homo.obs[ct_tgt].str.lower().values
+    types2 = sorted(np.unique(y2_raw))
+    d2 = {t: i for i, t in enumerate(types2)}
+    y2 = np.array([d2[c] for c in y2_raw])
+
+    def build_identity_graph(adata):
+        n = adata.obs.shape[0]
+        return [[i, i] for i in range(n)]
+
+    # Edge index construction
+    def build_edges_distance(pos, regions, thres, region_flag):
+        if region_flag:
+            return get_edge_index_standard_region(pos, regions, thres)
+        return get_edge_index_standard(pos, thres)
+
+    def build_edges_knn(adata, k, regions, region_flag):
+        if region_flag:
+            # TODO
+            return get_edge_index_standard_region(pos, regions, thres)
+        return get_edge_index_knn(adata, k)
     
-#     # n_samples = 10000
-#     # sampled_indices_ref = np.random.choice(adata_ref.n_obs, n_samples, replace=False)
-#     # adata_ref = adata_ref[sampled_indices_ref].copy()
+    if identity_graph:
+        e1 = build_identity_graph(ad_ref_homo)
+        e2 = build_identity_graph(ad_tgt_homo)
+    else:
+        e1 = build_edges_knn(
+            ad_ref_homo,
+            k_ref,
+            ad_ref_homo.obs[region_ref].values if region_ref else None,
+            region_ref is not None
+        )
 
-#     # sampled_indices_target = np.random.choice(adata_target.n_obs, n_samples, replace=False)
-#     # adata_target = adata_target[sampled_indices_target].copy()
-    
-#     # rename cell types to lower case to keep consistency
-#     adata_ref.obs[celltype_name_ref] = adata_ref.obs[celltype_name_ref].str.lower()
-#     adata_target.obs[celltype_name_target] = adata_target.obs[celltype_name_target].str.lower()
+        e2 = build_edges_knn(
+            ad_tgt_homo,
+            k_tgt,
+            ad_tgt_homo.obs[region_tgt].values if region_tgt else None,
+            region_tgt is not None
+        )
 
-#     # extract the homologous genes
-#     species1_gene_names = homo_genes_df['Gene name']
-#     species2_gene_names = homo_genes_df[f'{species2} gene name']
+    # Build Data objects
+    ref_data = Data(
+        homo_x=torch.FloatTensor(Xrh),
+        nonhomo_x=torch.FloatTensor(Xrn),
+        edge_index=torch.LongTensor(e1).T.contiguous(),
+        y=torch.LongTensor(y1)
+    )
+    ref_data.x = torch.cat([ref_data.homo_x, ref_data.nonhomo_x], dim=1)
 
-#     valid_pairs = []
-#     for species1_gene, species2_gene in zip(species1_gene_names, species2_gene_names):
-#         if (species1_gene in adata_ref.var_names) and (species2_gene in adata_target.var_names):
-#             valid_pairs.append((species1_gene, species2_gene))
+    tgt_data = Data(
+        homo_x=torch.FloatTensor(Xth),
+        nonhomo_x=torch.FloatTensor(Xtn),
+        edge_index=torch.LongTensor(e2).T.contiguous(),
+        y=torch.LongTensor(y2)
+    )
+    tgt_data.x = torch.cat([tgt_data.homo_x, tgt_data.nonhomo_x], dim=1)
 
-#     species1_genes_in_adata = [pair[0] for pair in valid_pairs]
-#     species2_genes_in_adata = [pair[1] for pair in valid_pairs]
+    inv_ref = {v: k for k, v in d1.items()}
+    inv_tgt = {v: k for k, v in d2.items()}
 
-#     print(f"Number of homologous pairs found: {len(valid_pairs)}")
-#     print(f"Number of {species1} genes found: {len(species1_genes_in_adata)}")
-#     print(f"Number of {species2} genes found: {len(species2_genes_in_adata)}")
+    return GraphDataset(ref_data, tgt_data), inv_ref, inv_tgt
 
-#     species1_counter = Counter(species1_genes_in_adata)
-#     species1_total_duplicates = sum(count - 1 for count in species1_counter.values() if count > 1)
-#     print(f"Total number of duplicated entries in species1 ({species1}): {species1_total_duplicates}")
-
-#     species2_counter = Counter(species2_genes_in_adata)
-#     species2_total_duplicates = sum(count - 1 for count in species2_counter.values() if count > 1)
-#     print(f"Total number of duplicated entries in species2 ({species2}): {species2_total_duplicates}")
-
-#     # extract the homo and nonhomo adata
-#     adata_ref_homo = adata_ref[:, species1_genes_in_adata].copy()
-#     nonhomo_genes_ref = ~adata_ref.var_names.isin(species1_genes_in_adata)
-#     adata_ref_nonhomo = adata_ref[:, nonhomo_genes_ref].copy()
-#     ref_X_homo, ref_X_nonhomo = adata_ref_homo.X, adata_ref_nonhomo.X
-
-#     adata_target_homo = adata_target[:, species2_genes_in_adata].copy()
-#     nonhomo_genes_target = ~adata_target.var_names.isin(species2_genes_in_adata)
-#     adata_target_nonhomo = adata_target[:, nonhomo_genes_target].copy()
-#     target_X_homo, target_X_nonhomo = adata_target_homo.X, adata_target_nonhomo.X
-
-#     # preprocess the raw counts
-#     adata_ref_homo, adata_ref_nonhomo, adata_target_homo, adata_target_nonhomo = preprocess(args, adata_ref_homo, adata_ref_nonhomo, adata_target_homo, adata_target_nonhomo)
-
-#     # Convert to dense if needed
-#     if hasattr(ref_X_homo, 'toarray'):
-#         ref_X_homo = ref_X_homo.toarray()
-#     if hasattr(ref_X_nonhomo, 'toarray'):
-#         ref_X_nonhomo = ref_X_nonhomo.toarray()
-#     if hasattr(target_X_homo, 'toarray'):
-#         target_X_homo = target_X_homo.toarray()
-#     if hasattr(target_X_nonhomo, 'toarray'):
-#         target_X_nonhomo = target_X_nonhomo.toarray()
-
-#     # Extract training features
-#     ref_pos = adata_ref.obsm[loc_name_ref]
-#     ref_y_raw = adata_ref.obs[celltype_name_ref].str.lower()
-#     ref_cell_types = np.sort(ref_y_raw.unique()).tolist()
-#     if region_name_ref:
-#         ref_slices = adata_ref.obs[region_name_ref]
-#         ref_edges = get_edge_index_standard_region(ref_pos, ref_slices, distance_thres_ref)
-#     else:
-#         ref_edges = get_edge_index_standard(ref_pos, distance_thres_ref)
-
-#     ref_cell_type_dict = {ct: i for i, ct in enumerate(ref_cell_types)}
-#     inverse_dict_ref = {i: ct for ct, i in ref_cell_type_dict.items()}
-#     ref_y = np.array([ref_cell_type_dict[ct] for ct in ref_y_raw])
-
-#     # Extract test features
-#     target_pos = adata_target.obsm[loc_name_target]
-#     target_y_raw = adata_target.obs[celltype_name_target].str.lower()
-#     target_cell_types = np.sort(target_y_raw.unique()).tolist()
-#     if region_name_target:
-#         target_slices = adata_target.obs[region_name_target]
-#         target_edges = get_edge_index_standard_region(target_pos, target_slices, distance_thres_target)
-#     else:
-#         target_edges = get_edge_index_standard(target_pos, distance_thres_target)
-
-#     target_cell_type_dict = {ct: i for i, ct in enumerate(target_cell_types)}
-#     inverse_dict_target = {i: ct for ct, i in target_cell_type_dict.items()}
-#     target_y_c = np.array([target_cell_type_dict[ct] for ct in target_y_raw])
-
-#     return ref_X_homo, ref_X_nonhomo, ref_y, ref_edges, inverse_dict_ref, target_X_homo, target_X_nonhomo, target_y_c, target_edges, inverse_dict_target
-
-def extract_and_preprocess_data(args, adata_ref, adata_target, species1, species2, homo_genes_df):
-    # rename cell types to lower case to keep consistency
-    adata_ref.obs = adata_ref.obs.copy()
-    adata_target.obs = adata_target.obs.copy()
-
-    # extract the homologous genes
-    species1_gene_names = homo_genes_df['Gene name']
-    species2_gene_names = homo_genes_df[f'{species2} gene name']
-
-    valid_pairs = [
-        (g1, g2) for g1, g2 in zip(species1_gene_names, species2_gene_names)
-        if g1 in adata_ref.var_names and g2 in adata_target.var_names
-    ]
-
-    species1_genes_in_adata = [pair[0] for pair in valid_pairs]
-    species2_genes_in_adata = [pair[1] for pair in valid_pairs]
-
-    print(f"Number of homologous pairs found: {len(valid_pairs)}")
-    print(f"Number of {species1} genes found: {len(species1_genes_in_adata)}")
-    print(f"Number of {species2} genes found: {len(species2_genes_in_adata)}")
-
-    # Count duplicates
-    from collections import Counter
-    species1_counter = Counter(species1_genes_in_adata)
-    species2_counter = Counter(species2_genes_in_adata)
-    print(f"Total duplicates in {species1}: {sum(c-1 for c in species1_counter.values() if c > 1)}")
-    print(f"Total duplicates in {species2}: {sum(c-1 for c in species2_counter.values() if c > 1)}")
-
-    # Subset and preprocess
-    adata_ref_homo = adata_ref[:, species1_genes_in_adata].copy()
-    adata_ref_homo = adata_ref_homo[:, ~adata_ref_homo.var_names.duplicated(keep='first')] # remove the duplicate variables
-    adata_ref_nonhomo = adata_ref[:, ~adata_ref.var_names.isin(species1_genes_in_adata)].copy()
-    adata_target_homo = adata_target[:, species2_genes_in_adata].copy()
-    adata_target_homo = adata_target_homo[:, ~adata_target_homo.var_names.duplicated(keep='first')] # remove the duplicate variables
-    adata_target_nonhomo = adata_target[:, ~adata_target.var_names.isin(species2_genes_in_adata)].copy()
-
-    # Preprocess (assumes preprocess function modifies AnnData objects in-place or returns updated copies)
-    return preprocess(args, adata_ref_homo, adata_ref_nonhomo, adata_target_homo, adata_target_nonhomo, valid_pairs)
-
-def load_dataset(args, adata_ref_homo, adata_ref_nonhomo, 
-                adata_target_homo, adata_target_nonhomo,
-                distance_thres_ref, distance_thres_target,
-                celltype_name_ref, celltype_name_target,
-                loc_name_ref, loc_name_target,
-                region_name_ref=None, region_name_target=None):
-    
-    # Preprocess and extract features
-    # adata_ref_homo, adata_ref_nonhomo, adata_target_homo, adata_target_nonhomo = extract_and_preprocess_data(
-    #     args, adata_ref, adata_target, species1, species2, homo_genes_df
-    # )
-
-    # Convert to dense if needed
-    ref_X_homo = adata_ref_homo.X.toarray() if hasattr(adata_ref_homo.X, 'toarray') else adata_ref_homo.X
-    ref_X_nonhomo = adata_ref_nonhomo.X.toarray() if hasattr(adata_ref_nonhomo.X, 'toarray') else adata_ref_nonhomo.X
-    target_X_homo = adata_target_homo.X.toarray() if hasattr(adata_target_homo.X, 'toarray') else adata_target_homo.X
-    target_X_nonhomo = adata_target_nonhomo.X.toarray() if hasattr(adata_target_nonhomo.X, 'toarray') else adata_target_nonhomo.X
-
-    # Reference labels and edges
-    ref_pos = adata_ref_homo.obsm[loc_name_ref]
-    ref_y_raw = adata_ref_homo.obs[celltype_name_ref].str.lower()
-    ref_cell_types = np.sort(ref_y_raw.unique()).tolist()
-    ref_edges = get_edge_index_standard_region(ref_pos, adata_ref_homo.obs[region_name_ref], distance_thres_ref) if region_name_ref else get_edge_index_standard(ref_pos, distance_thres_ref)
-    ref_cell_type_dict = {ct: i for i, ct in enumerate(ref_cell_types)}
-    inverse_dict_ref = {i: ct for ct, i in ref_cell_type_dict.items()}
-    ref_y = np.array([ref_cell_type_dict[ct] for ct in ref_y_raw])
-
-    # Target labels and edges
-    target_pos = adata_target_homo.obsm[loc_name_target]
-    target_y_raw = adata_target_homo.obs[celltype_name_target].str.lower()
-    target_cell_types = np.sort(target_y_raw.unique()).tolist()
-    target_edges = get_edge_index_standard_region(target_pos, adata_target_homo.obs[region_name_target], distance_thres_target) if region_name_target else get_edge_index_standard(target_pos, distance_thres_target)
-    target_cell_type_dict = {ct: i for i, ct in enumerate(target_cell_types)}
-    inverse_dict_target = {i: ct for ct, i in target_cell_type_dict.items()}
-    target_y_c = np.array([target_cell_type_dict[ct] for ct in target_y_raw])
-
-    return (ref_X_homo, ref_X_nonhomo, ref_y, ref_edges, inverse_dict_ref,
-            target_X_homo, target_X_nonhomo, target_y_c, target_edges, inverse_dict_target)
-
-
-class GraphDataset(InMemoryDataset):
-    def __init__(self, ref_X_homo=None, ref_X_nonhomo=None, ref_y=None,
-                 target_X_homo=None, target_X_nonhomo=None, target_y=None,
-                 ref_edges=None, target_edges=None,
-                 ref_data=None, target_data=None):
-        self.root = '.'
-        super(GraphDataset, self).__init__(self.root)
-        if ref_data and target_data:
-            self.ref_data = ref_data
-            self.target_data = target_data
-        else:
-            self.ref_data = Data(homo_x=torch.FloatTensor(ref_X_homo),
-                                nonhomo_x=torch.FloatTensor(ref_X_nonhomo),
-                                edge_index=torch.LongTensor(ref_edges).T,
-                                y=torch.LongTensor(ref_y))
-            self.ref_data.x = torch.cat([self.ref_data.homo_x, self.ref_data.nonhomo_x], dim=1)
-            
-            self.target_data = Data(homo_x=torch.FloatTensor(target_X_homo),
-                                    nonhomo_x=torch.FloatTensor(target_X_nonhomo),
-                                    edge_index=torch.LongTensor(target_edges).T,
-                                    y=torch.LongTensor(target_y))
-            self.target_data.x = torch.cat([self.target_data.homo_x, self.target_data.nonhomo_x], dim=1)
-            
+class GraphDataset(Dataset):
+    def __init__(self, ref_data, target_data):
+        self.ref_data    = ref_data
+        self.target_data = target_data
 
     @classmethod
-    def from_saved(cls, ref_path='ref_data.pt', target_path='target_data.pt'):
-        ref_data = torch.load(ref_path)
-        target_data = torch.load(target_path)
-        return cls(ref_data=ref_data, target_data=target_data)
+    def from_saved(cls, ref_path: str, target_path: str):
+        ref = torch.load(ref_path)
+        tgt = torch.load(target_path)
+        return cls(ref, tgt)
 
     def __len__(self):
-        return 2
+        return 1
 
     def __getitem__(self, idx):
         return self.ref_data, self.target_data
